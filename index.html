@@ -24,5 +24,15 @@
     Typer.speed = 12;
     Typer.file = 'kernel.txt';
     Typer.init();
+
+    let counter = 0;
+    let iv = setInterval(() => {
+        Typer.addText( {key: 'a'} );
+        counter += 1;
+        if (counter == 33){
+            clearInterval(iv);
+        }
+    }, 12);
 </script>
 </html>
+
