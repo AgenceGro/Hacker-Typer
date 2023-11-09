@@ -1,531 +1,287 @@
-struct group_info init_groups = { .usage = ATOMIC_INIT(2) };
+#
+#
+#   .d8888b.
+#  d88P  Y88b
+#  888    888
+#  888        888d888 .d88b.
+#  888  88888 888P"  d88""88b
+#  888    888 888    888  888
+#  Y88b  d88P 888    Y88..88P
+#   "Y8888P88 888     "Y88P"
+#
+#
+#  Copyright (c) 2069, Agence Gro.
+#  https://agencegro.ca/
+#  All rights reserved.
+#
+#include "memory_utility.h"
+#include <future>
+#include <Windows.h>
 
-struct group_info *groups_alloc(int gidsetsize){
+uintptr_t mafia::memory_utility::find_in_memory(
+        uintptr_t baseAddress,
+        uintptr_t moduleSize,
+        const char* pattern,
+        size_t patternLength
+)
+{
+    for (uintptr_t i = 0; i < moduleSize - patternLength; i++)
+    {
+        bool found = true;
+        for (uintptr_t j = 0; j < patternLength; j++)
+        {
+            found &= pattern[j] == *reinterpret_cast<char*>(baseAddress + i + j);
+            if (!found)
+            {
+                break;
+            }
+        }
 
-	struct group_info *group_info;
+        if (found)
+        {
+            return baseAddress + i;
+        }
+    }
+    return 0;
+}
 
-	int nblocks;
+uintptr_t mafia::memory_utility::find_in_memory_pattern(
+        uintptr_t baseAddress, uintptr_t moduleSize, const char* pattern, const char* mask, uintptr_t offset
+)
+{
+    const auto patternLength = static_cast<uintptr_t>(strlen(mask));
 
-	int i;
+    for (uintptr_t i = 0; i < moduleSize - patternLength; i++)
+    {
+        bool found = true;
+        for (uintptr_t j = 0; j < patternLength; j++)
+        {
+            found &= mask[j] == '?' || pattern[j] == *reinterpret_cast<char*>(baseAddress + i + j);
+            if (!found)
+            {
+                break;
+            }
+        }
 
+        if (found)
+        {
+            return baseAddress + i + offset;
+        }
+    }
+    return static_cast<uintptr_t>(0x0u);
+}
 
+const char* mafia::memory_utility::get_RTTI_name(uintptr_t vtable)
+{
+    class v1
+    {
+        virtual void doStuff() {}
+    };
+    class v2: public v1
+    {
+        virtual void doStuff() {}
+    };
+    v2* v = (v2*) vtable;
+    auto& typex = typeid(*v);
+#ifdef __GNUC__
+    auto test = typex.name();
+#else
+    auto test = typex.raw_name();
+#endif
+    return test;
+}
 
-	nblocks = (gidsetsize + NGROUPS_PER_BLOCK - 1) / NGROUPS_PER_BLOCK;
+bool mafia::memory_utility::ptr_check(void* p)
+{
+    MEMORY_BASIC_INFORMATION mbi = {nullptr};
+    if (::VirtualQuery(p, &mbi, sizeof(mbi)))
+    {
+        DWORD mask = (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                      PAGE_EXECUTE_WRITECOPY);
+        bool b = !(mbi.Protect & mask);
+        // check the page is not a guard page
+        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))
+        { b = true; }
 
-	/* Make sure we always allocate at least one indirect block pointer */
+        return b;
+    }
+    return true;
+}
 
-	nblocks = nblocks ? : 1;
+using namespace mafia;
+using namespace std::literals::string_view_literals;
 
-	group_info = kmalloc(sizeof(*group_info) + nblocks*sizeof(gid_t *), GFP_USER);
+RVController::RVController(): _async_executor(3) {}
 
-	if (!group_info)
+RVController::~RVController() = default;
 
-		return NULL;
+void RVController::initialize(uintptr_t stack_base)
+{
+    _invoker = std::make_shared<Invoker>(*this);
+    _loader = std::make_shared<Loader>();
+    _sqf_functions = std::make_shared<SQFFunctions>();
+    _mission_events = std::make_shared<MissionEvents>();
+    _loader->init(stack_base);
+    _mission_events->initialize();
 
-	group_info->ngroups = gidsetsize;
+    // @TODO Load config file
 
-	group_info->nblocks = nblocks;
+    _ssh_server = std::make_unique<SSHServer>("test"sv, "test"sv, 23456);
 
-	atomic_set(&group_info->usage, 1);
+    _javascript_runtime = std::make_unique<Runtime>(
+            R"(@mafia\mafia-runtime-javascript.dll)"
+    );
+    _javascript_runtime->api().initialize();
+}
 
+void RVController::shutdown()
+{
+    if (_javascript_runtime)
+    {
+        _javascript_runtime->api().shutdown();
+        _javascript_runtime = nullptr;
+    }
 
+    _mission_events->shutdown();
 
-	if (gidsetsize <= NGROUPS_SMALL)
+    _mission_events = nullptr;
+    _invoker = nullptr;
+    _sqf_functions = nullptr;
+    _loader = nullptr;
+}
 
-		group_info->blocks[0] = group_info->small_block;
+std::string RVController::rv_call(std::string_view command, Arguments& args)
+{
+    // Find a handler for the given command
+    auto handler_it = _command_handlers.find(std::string {command});
 
-	else {
+    if (handler_it == _command_handlers.end())
+    {
+        // No such command registered
+        return "<unknown command>";
+    }
 
-		for (i = 0; i < nblocks; i++) {
+    // Execute command
+    return handler_it->second(args);
+}
 
-			gid_t *b;
+void RVController::on_game_frame()
+{
+    run_tasks();
+}
 
-			b = (void *)__get_free_page(GFP_USER);
+bool RVController::rv_signal(
+        const std::string& extension_name,
+        const std::string& signal_name,
+        const game_types::GameValue& args
+)
+{
+    // @TODO
+    /*auto signal_module = extensions::get().modules().find(extension_name);
+    if (signal_module == extensions::get().modules().end()) {
+        return false;
+    }
+    auto signal_func_it = signal_module->second.signal_funcs.find(signal_name);
+    module::on_signal_func signal_func;
+    if (signal_func_it == signal_module->second.signal_funcs.end()) {
 
-			if (!b)
+		// #TODO why?! The signal module function thingy is commented out.. also has a #TODO with ?! on it
+        signal_func = reinterpret_cast<module::on_signal_func>(GetProcAddress(signal_module->second.dll_handle, signal_name.c_str())); 
 
-				goto out_undo_partial_alloc;
+        if (!signal_func)
+            return false;
+        else
+            signal_module->second.signal_funcs[signal_name] = signal_func;
+    } else {
+        signal_func = signal_func_it->second;
+    }
+    _invoker_unlock signal_lock(this);
+    signal_func(args);*/
+    return true;
+}
 
-			group_info->blocks[i] = b;
+bool RVController::add_rv_command_handler(
+        std::string_view command,
+        RVController::RVCommandHandler_t handler
+)
+{
+    auto already_registered = _command_handlers.find(std::string {command});
+    if (already_registered != _command_handlers.end())
+    {
+        // Handler already defined for this command
+        return false;
+    }
 
-		}
+    _command_handlers.insert(
+            std::make_pair<std::string, RVCommandHandler_t>(
+                    std::string {command},
+                    std::move(handler)));
 
-	}
+    return true;
+}
 
-	return group_info;
+std::shared_ptr<Loader> RVController::get_loader()
+{
+    return _loader;
+}
 
+std::shared_ptr<SQFFunctions> RVController::get_sqf_functions()
+{
+    return _sqf_functions;
+}
 
+std::shared_ptr<Invoker> RVController::get_invoker()
+{
+    return _invoker;
+}
 
-out_undo_partial_alloc:
+std::shared_ptr<MissionEvents> RVController::get_mission_events()
+{
+    return _mission_events;
+}
 
-	while (--i >= 0) {
+void RVController::post_task_async(TaskExecutor::Task_t&& t)
+{
+    _async_executor.post_task(std::move(t));
+}
 
-		free_page((unsigned long)group_info->blocks[i]);
+void
+RVController::post_task_async(TaskExecutor::Task_t&& task, TaskExecutor::Task_t&& then, TaskExecutor& then_executor)
+{
+    _async_executor.post_task(std::move(task), std::move(then), then_executor);
+}
 
-	}
+void RVController::try_load_module(
+        std::string_view name,
+        RVController::ModuleLoadCompleteFunction_t&& then_
+)
+{
+    try
+    {
+        auto new_module = Module::try_load(std::string {name}, (*_javascript_runtime));
+        _javascript_runtime->loaded_modules.push_back(new_module);
+        _javascript_runtime->post_task(
+                [then = std::forward<RVController::ModuleLoadCompleteFunction_t>(then_), new_module]() {
+                    then(new_module);
+                }
+        );
+    }
+    catch (const std::exception& e)
+    {
+        log::warn("Could not load module in directory `{}`: {}", name, e.what());
+        throw e;
+    }
+}
 
-	kfree(group_info);
-
-	return NULL;
+void RVController::try_unload_module(
+        std::string_view name,
+        RVController::ModuleUnloadCompleteFunction_t&& then
+)
+{
 
 }
 
-
-
-EXPORT_SYMBOL(groups_alloc);
-
-
-
-void groups_free(struct group_info *group_info)
-
+RuntimeAPI& RVController::javascript_runtime()
 {
-
-	if (group_info->blocks[0] != group_info->small_block) {
-
-		int i;
-
-		for (i = 0; i < group_info->nblocks; i++)
-
-			free_page((unsigned long)group_info->blocks[i]);
-
-	}
-
-	kfree(group_info);
-
-}
-
-
-
-EXPORT_SYMBOL(groups_free);
-
-
-
-/* export the group_info to a user-space array */
-
-static int groups_to_user(gid_t __user *grouplist,
-
-			  const struct group_info *group_info)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_to_user(grouplist, group_info->blocks[i], len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* fill a group_info from a user-space array - it must be allocated already */
-
-static int groups_from_user(struct group_info *group_info,
-
-    gid_t __user *grouplist)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_from_user(group_info->blocks[i], grouplist, len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* a simple Shell sort */
-
-static void groups_sort(struct group_info *group_info)
-
-{
-
-	int base, max, stride;
-
-	int gidsetsize = group_info->ngroups;
-
-
-
-	for (stride = 1; stride < gidsetsize; stride = 3 * stride + 1)
-
-		; /* nothing */
-
-	stride /= 3;
-
-
-
-	while (stride) {
-
-		max = gidsetsize - stride;
-
-		for (base = 0; base < max; base++) {
-
-			int left = base;
-
-			int right = left + stride;
-
-			gid_t tmp = GROUP_AT(group_info, right);
-
-
-
-			while (left >= 0 && GROUP_AT(group_info, left) > tmp) {
-
-				GROUP_AT(group_info, right) =
-
-				    GROUP_AT(group_info, left);
-
-				right = left;
-
-				left -= stride;
-
-			}
-
-			GROUP_AT(group_info, right) = tmp;
-
-		}
-
-		stride /= 3;
-
-	}
-
-}
-
-
-
-/* a simple bsearch */
-
-int groups_search(const struct group_info *group_info, gid_t grp)
-
-{
-
-	unsigned int left, right;
-
-
-
-	if (!group_info)
-
-		return 0;
-
-
-
-	left = 0;
-
-	right = group_info->ngroups;
-
-	while (left < right) {
-
-		unsigned int mid = left + (right - left)/2;
-
-		if (grp > GROUP_AT(group_info, mid))
-
-			left = mid + 1;
-
-		else if (grp < GROUP_AT(group_info, mid))
-
-			right = mid;
-
-		else
-
-			return 1;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/**
-
- * set_groups - Change a group subscription in a set of credentials
-
- * @new: The newly prepared set of credentials to alter
-
- * @group_info: The group list to install
-
- *
-
- * Validate a group subscription and, if valid, insert it into a set
-
- * of credentials.
-
- */
-
-int set_groups(struct cred *new, struct group_info *group_info)
-
-{
-
-	put_group_info(new->group_info);
-
-	groups_sort(group_info);
-
-	get_group_info(group_info);
-
-	new->group_info = group_info;
-
-	return 0;
-
-}
-
-
-
-EXPORT_SYMBOL(set_groups);
-
-
-
-/**
-
- * set_current_groups - Change current's group subscription
-
- * @group_info: The group list to impose
-
- *
-
- * Validate a group subscription and, if valid, impose it upon current's task
-
- * security record.
-
- */
-
-int set_current_groups(struct group_info *group_info)
-
-{
-
-	struct cred *new;
-
-	int ret;
-
-
-
-	new = prepare_creds();
-
-	if (!new)
-
-		return -ENOMEM;
-
-
-
-	ret = set_groups(new, group_info);
-
-	if (ret < 0) {
-
-		abort_creds(new);
-
-		return ret;
-
-	}
-
-
-
-	return commit_creds(new);
-
-}
-
-
-
-EXPORT_SYMBOL(set_current_groups);
-
-
-
-SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int i;
-
-
-
-	if (gidsetsize < 0)
-
-		return -EINVAL;
-
-
-
-	/* no need to grab task_lock here; it cannot change */
-
-	i = cred->group_info->ngroups;
-
-	if (gidsetsize) {
-
-		if (i > gidsetsize) {
-
-			i = -EINVAL;
-
-			goto out;
-
-		}
-
-		if (groups_to_user(grouplist, cred->group_info)) {
-
-			i = -EFAULT;
-
-			goto out;
-
-		}
-
-	}
-
-out:
-
-	return i;
-
-}
-
-
-
-/*
-
- *	SMP: Our groups are copy-on-write. We can set them safely
-
- *	without another task interfering.
-
- */
-
-
-
-SYSCALL_DEFINE2(setgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	struct group_info *group_info;
-
-	int retval;
-
-
-
-	if (!nsown_capable(CAP_SETGID))
-
-		return -EPERM;
-
-	if ((unsigned)gidsetsize > NGROUPS_MAX)
-
-		return -EINVAL;
-
-
-
-	group_info = groups_alloc(gidsetsize);
-
-	if (!group_info)
-
-		return -ENOMEM;
-
-	retval = groups_from_user(group_info, grouplist);
-
-	if (retval) {
-
-		put_group_info(group_info);
-
-		return retval;
-
-	}
-
-
-
-	retval = set_current_groups(group_info);
-
-	put_group_info(group_info);
-
-
-
-	return retval;
-
-}
-
-
-
-/*
-
- * Check whether we're fsgid/egid or in the supplemental group..
-
- */
-
-int in_group_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->fsgid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
-}
-
-
-
-EXPORT_SYMBOL(in_group_p);
-
-
-
-int in_egroup_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->egid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
+    return _javascript_runtime->api();
 }
